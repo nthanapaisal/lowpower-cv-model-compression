@@ -1,0 +1,8 @@
+# Dependencies for local dataset loading and TorchScript export.
+# On the Jetson, use the course-provided NVIDIA PyTorch build; do not replace it
+# with a generic PyPI build.
+datasets<4.0
+Pillow
+numpy
+torch
+transformers
