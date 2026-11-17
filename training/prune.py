@@ -578,7 +578,7 @@ def write_metrics(results: list[dict], txt_path: Path, csv_path: Path, note: str
 
 def run_prune(model, ratios, mlp_scale: float, decoder_scale: float, output_dir: Path,
               prefix: str = "segformer_b2", start: str | None = None, verify: bool = True,
-              note: str = "", metrics_dir: Path | None = None) -> list[dict]:
+              note: str = "", metrics_dir: Path | None = None, tag: str = "") -> list[dict]:
     """Prune step by step, save every candidate, and write the metrics files."""
     from transformers import SegformerForSemanticSegmentation
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -607,7 +607,7 @@ def run_prune(model, ratios, mlp_scale: float, decoder_scale: float, output_dir:
         print(f"{name}: {result['params'] / 1e6:.2f} M params, {result['macs_g']:.2f} G MACs, "
               f"{result['size_mib']:.1f} MiB, self-check {'passed' if verify else 'skipped'}", flush=True)
     metrics_dir = metrics_dir or PROJECT_DIR
-    stem = "pruning_metrics" + (f"_from_{Path(start).stem}" if start else "")
+    stem = "pruning_metrics" + (f"_from_{Path(start).stem}" if start else "") + (f"_{tag}" if tag else "")
     write_metrics(results, metrics_dir / f"{stem}.txt", metrics_dir / f"{stem}.csv", note)
     print(f"Metrics: {metrics_dir / (stem + '.txt')} and {stem}.csv", flush=True)
     return results
@@ -946,9 +946,12 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "prune":
+        tag = ""
         if args.ratios is None:
             steps = int(round(args.max_ratio / args.step))
             args.ratios = [round(args.step * k, 4) for k in range(1, steps + 1)]
+        else:   # a refinement run gets its own metrics files, so the ladder's report is kept
+            tag = "_".join(f"{int(round(r * 100)):02d}" for r in sorted(args.ratios))
         if any(not 0.0 < r <= 0.95 for r in args.ratios):
             parser.error("ratios must be above 0 and at most 0.95")
         if args.start:
@@ -960,7 +963,7 @@ def main() -> None:
         save_preprocessing(args.checkpoint, args.output_dir)
         run_prune(model, args.ratios, args.mlp_scale, args.decoder_scale, args.output_dir,
                   prefix=args.prefix, start=str(args.start) if args.start else None, verify=not args.no_verify,
-                  metrics_dir=args.metrics_dir)
+                  metrics_dir=args.metrics_dir, tag=tag)
     elif args.command == "latency":
         pattern = re.compile(r"segformer_b2(_pruned\d+)?\.torchscript\.pt$")   # not *_ft files
         found = {p for d in (REPO_DIR / "model", OUTPUT_DIR) for p in d.glob("segformer_b2*.torchscript.pt")
