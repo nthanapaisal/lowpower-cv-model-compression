@@ -49,8 +49,8 @@ Before running on Jetson run these scripts below and paste them /output_txt:
 ---------------------------------------------------------------
 Flow:
 
-Luke: load_model.py -> (1) prune.py -> (2) finetune.py -> export.py -> evaluate.py
+Luke: load_model.py -> (1) prune.py -> (2) finetune.py -> export.py into onnx
 
-Nikki: load_model.py -> (1) quantization.py -> (2) export.py  -> (3) evaluate.py -> (4) distill.py -> evaluate.py
+Nikki: load_model.py -> (0) convert models into onnx -> (1) quantization.py engines -> (2) evaluate.py -> (4) distill.py -> evaluate.py
 
 

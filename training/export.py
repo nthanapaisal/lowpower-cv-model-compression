@@ -1,86 +1,121 @@
-"""Export the four Lab 1 MobileNetV2 checkpoints as fixed-shape ONNX models."""
+#!/usr/bin/env python3
+"""Export a saved PyTorch ``.pth`` model/checkpoint to ONNX.
+
+Examples (from the repository root)::
+
+    python3 training/export.py S0
+    python3 training/export.py S0 --checkpoint results/S0.pth
+
+The default lookup checks ``results/``, ``training/results/``, ``model/`` and
+``training/model/`` for ``<name>.pth``. A checkpoint containing a serialized
+``torch.nn.Module`` can be exported directly. For a weights-only state dict,
+provide ``--architecture`` and ``--num-classes`` to construct the model with
+timm first.
+"""
 
 import argparse
 from pathlib import Path
 
-import timm
 import torch
 
 
-MODEL_NAMES = ("S0", "S30", "S50", "S70")
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def load_model(checkpoint_path: Path, architecture: str, num_classes: int):
-    """Load either a regular state dict or a physically pruned full model."""
+def find_checkpoint(name: str, explicit_path: Path | None) -> Path:
+    if explicit_path is not None:
+        path = explicit_path.expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if not path.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+        return path
+
+    filename = name if name.lower().endswith(".pth") else f"{name}.pth"
+    candidates = [ROOT / folder / filename for folder in (
+        "results", "training/results", "model", "training/model"
+    )]
+    for path in candidates:
+        if path.is_file():
+            return path
+    searched = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(
+        f"No checkpoint for {name!r}. Looked in: {searched}. "
+        "Use --checkpoint to specify its location."
+    )
+
+
+def load_model(checkpoint_path: Path, architecture: str | None,
+               num_classes: int | None) -> torch.nn.Module:
     try:
-        checkpoint = torch.load(
-            checkpoint_path, map_location="cpu", weights_only=False
-        )
-    except TypeError:  # Older course PyTorch versions lack weights_only.
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    except TypeError:  # PyTorch versions before weights_only was added.
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
     if isinstance(checkpoint, torch.nn.Module):
         model = checkpoint
-    elif isinstance(checkpoint, dict) and isinstance(
-        checkpoint.get("model"), torch.nn.Module
-    ):
+    elif isinstance(checkpoint, dict) and isinstance(checkpoint.get("model"), torch.nn.Module):
         model = checkpoint["model"]
     else:
-        state_dict = checkpoint.get("model", checkpoint) if isinstance(
-            checkpoint, dict
-        ) else checkpoint
+        if not architecture:
+            raise ValueError(
+                f"{checkpoint_path} contains weights only. Pass --architecture "
+                "and (if needed) --num-classes so the model structure can be created."
+            )
+        try:
+            import timm
+        except ImportError as exc:
+            raise SystemExit("Loading a weights-only checkpoint requires timm.") from exc
+        state_dict = checkpoint
+        if isinstance(checkpoint, dict):
+            for key in ("state_dict", "model_state_dict", "model"):
+                if key in checkpoint and isinstance(checkpoint[key], dict):
+                    state_dict = checkpoint[key]
+                    break
+        if not isinstance(state_dict, dict):
+            raise ValueError(f"Unsupported checkpoint format: {checkpoint_path}")
         model = timm.create_model(
-            architecture, pretrained=False, num_classes=num_classes
+            architecture, pretrained=False,
+            num_classes=num_classes if num_classes is not None else 1000,
         )
+        # Handle checkpoints saved from DistributedDataParallel.
+        state_dict = {key.removeprefix("module."): value
+                      for key, value in state_dict.items()}
         model.load_state_dict(state_dict)
     return model.cpu().eval()
 
 
-def export_onnx(checkpoint_path: Path, output_path: Path, architecture: str,
-                num_classes: int):
-    model = load_model(checkpoint_path, architecture, num_classes)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    example = torch.randn(1, 3, 224, 224)
-    torch.onnx.export(
-        model,
-        example,
-        output_path,
-        input_names=["input"],
-        output_names=["logits"],
-        dynamic_axes=None,
-        opset_version=17,
-        dynamo=False,
-    )
-    print(f"saved fixed-shape ONNX model: {output_path}")
-
-
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--checkpoints", nargs=4, type=Path,
-        metavar=("S0", "S30", "S50", "S70"),
-        default=[Path("results") / f"{name}.pth" for name in MODEL_NAMES],
-        help="checkpoints in S0, S30, S50, S70 order "
-             "(default: results/<model>.pth)",
-    )
-    parser.add_argument(
-        "--output-dir", type=Path, default=Path("."),
-        help="directory for S0.onnx, S30.onnx, S50.onnx, and S70.onnx",
-    )
-    parser.add_argument("--architecture", default="mobilenetv2_100")
-    parser.add_argument("--num-classes", type=int, default=10)
+    parser.add_argument("model", help="model/checkpoint name, for example S0")
+    parser.add_argument("--checkpoint", type=Path,
+                        help="explicit .pth path (overrides automatic lookup)")
+    parser.add_argument("--output", type=Path,
+                        help="ONNX output path (default: onnx/<model>.onnx)")
+    parser.add_argument("--architecture",
+                        help="timm architecture for a weights-only checkpoint")
+    parser.add_argument("--num-classes", type=int,
+                        help="classifier output count for --architecture")
+    parser.add_argument("--height", type=int, default=224,
+                        help="input image height (default: 224)")
+    parser.add_argument("--width", type=int, default=224,
+                        help="input image width (default: 224)")
+    parser.add_argument("--opset", type=int, default=17)
     args = parser.parse_args()
 
-    missing = [path for path in args.checkpoints if not path.is_file()]
-    if missing:
-        paths = ", ".join(str(path) for path in missing)
-        parser.error(f"missing checkpoint(s): {paths}")
-
-    for name, checkpoint in zip(MODEL_NAMES, args.checkpoints):
-        export_onnx(
-            checkpoint, args.output_dir / f"{name}.onnx",
-            args.architecture, args.num_classes,
-        )
+    checkpoint_path = find_checkpoint(args.model, args.checkpoint)
+    output_path = args.output or (ROOT / "onnx" / f"{args.model}.onnx")
+    if not output_path.is_absolute():
+        output_path = Path.cwd() / output_path
+    model = load_model(checkpoint_path, args.architecture, args.num_classes)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sample = torch.zeros(1, 3, args.height, args.width, dtype=torch.float32)
+    torch.onnx.export(
+        model, sample, str(output_path),
+        input_names=["input"], output_names=["output"],
+        opset_version=args.opset, dynamo=False,
+    )
+    print(f"Exported {checkpoint_path} -> {output_path}")
 
 
 if __name__ == "__main__":
