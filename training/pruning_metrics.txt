@@ -1,21 +1,26 @@
 SegFormer-B2 structured pruning: metrics
 ============================================================
-Shape-only run: every number below (params, MACs, file size, channels,
-sparsity, widths) depends only on the layer shapes, so it is the same for the
-real nvidia/segformer-b2-finetuned-ade-512-512 weights. Which channels are
-removed does depend on the weights: run `python3 training/prune.py prune` with
-the real checkpoint to produce the .pth/.torchscript.pt files (it rewrites this
-file with the same numbers).
+Shape-only run: every number below (params, MACs, file size, channels, sparsity, widths) depends only
+on the layer shapes, so it is the same for the real nvidia/segformer-b2-finetuned-ade-512-512 weights.
+Which channels are removed does depend on the weights: run `python3 training/prune.py prune` with the
+real checkpoint to produce the .pth/.torchscript.pt/.onnx files (it rewrites this file with the same numbers).
+The ladder goes to 90%; the Jetson latency sweep (prune.py latency) decides where to stop.
 
 Definitions
   params           all weights and biases
-  MACs             multiply-accumulates for one 512x512 image (the SegFormer
-                   paper calls these FLOPs)
+  MACs             multiply-accumulates for one 512x512 image (the SegFormer paper calls these FLOPs)
   file size        FP32 state dict saved with torch.save
-  channels kept    output channels left in the 21 pruned layers (16 MLP +
-                   5 decoder)
-  sparsity         share removed; structured pruning leaves no zeros, the
-                   layers are smaller
+  channels kept    output channels left in the 21 pruned layers (16 MLP + 5 decoder)
+  sparsity         share removed; structured pruning leaves no zeros, the layers are smaller
+
+Unpruned MACs by part (total 62.34 G):
+  decoder fuse                                38.65 G   62.0%
+  encoder MLP (pruned)                        10.68 G   17.1%
+  attention layers (not pruned)                4.46 G    7.1%
+  attention products QK^T, AV (not pruned)     3.89 G    6.2%
+  decoder classifier                           1.89 G    3.0%
+  decoder projections                          1.56 G    2.5%
+  patch embeddings (not pruned)                1.21 G    1.9%
 
 segformer_b2_pruned10  (ratio 10%)
 ------------------------------------------------------------
@@ -282,3 +287,80 @@ segformer_b2_pruned70  (ratio 70%)
      decode_head.linear_fuse: (768, 3072, 1, 1) -> (230, 920, 1, 1)
      decode_head.batch_norm: (768,) -> (230,)
      decode_head.classifier: (150, 768, 1, 1) -> (150, 230, 1, 1)
+
+segformer_b2_pruned80  (ratio 80%)
+------------------------------------------------------------
+1. params:         27,461,974 -> 14,863,923  (27.46 M -> 14.86 M)
+2. MACs:           62.34 G -> 13.94 G  (4.47x fewer)
+3. file size:      104.9 MiB -> 56.8 MiB
+4. channels kept:  20,480 -> 4,097 of 20,480
+5. sparsity:       45.9% of parameters removed, 80.0% of channels removed in the pruned layers, 77.6% of MACs removed
+6. layers changed, by block:
+   block 1 (stage 1, block 1): 256 -> 51 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 2 (stage 1, block 2): 256 -> 51 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 3 (stage 1, block 3): 256 -> 51 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 4 (stage 2, block 1): 512 -> 102 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 5 (stage 2, block 2): 512 -> 102 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 6 (stage 2, block 3): 512 -> 102 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 7 (stage 2, block 4): 512 -> 102 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 8 (stage 3, block 1): 1280 -> 256 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 9 (stage 3, block 2): 1280 -> 256 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 10 (stage 3, block 3): 1280 -> 256 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 11 (stage 3, block 4): 1280 -> 256 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 12 (stage 3, block 5): 1280 -> 256 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 13 (stage 3, block 6): 1280 -> 256 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 14 (stage 4, block 1): 2048 -> 410 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 15 (stage 4, block 2): 2048 -> 410 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 16 (stage 4, block 3): 2048 -> 410 expanded channels  [fc1, dwconv.dwconv, fc2]
+   decoder projection 1 (from stage 1): 768 -> 154 channels
+   decoder projection 2 (from stage 2): 768 -> 154 channels
+   decoder projection 3 (from stage 3): 768 -> 154 channels
+   decoder projection 4 (from stage 4): 768 -> 154 channels
+   decoder fuse: 768 -> 154 channels
+   decoder layers that changed shape (weight shape before -> after):
+     decode_head.linear_projections.0.proj: (768, 64) -> (154, 64)
+     decode_head.linear_projections.1.proj: (768, 128) -> (154, 128)
+     decode_head.linear_projections.2.proj: (768, 320) -> (154, 320)
+     decode_head.linear_projections.3.proj: (768, 512) -> (154, 512)
+     decode_head.linear_fuse: (768, 3072, 1, 1) -> (154, 616, 1, 1)
+     decode_head.batch_norm: (768,) -> (154,)
+     decode_head.classifier: (150, 768, 1, 1) -> (150, 154, 1, 1)
+
+segformer_b2_pruned90  (ratio 90%)
+------------------------------------------------------------
+1. params:         27,461,974 -> 13,500,529  (27.46 M -> 13.50 M)
+2. MACs:           62.34 G -> 11.36 G  (5.49x fewer)
+3. file size:      104.9 MiB -> 51.6 MiB
+4. channels kept:  20,480 -> 2,050 of 20,480
+5. sparsity:       50.8% of parameters removed, 90.0% of channels removed in the pruned layers, 81.8% of MACs removed
+6. layers changed, by block:
+   block 1 (stage 1, block 1): 256 -> 26 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 2 (stage 1, block 2): 256 -> 26 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 3 (stage 1, block 3): 256 -> 26 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 4 (stage 2, block 1): 512 -> 51 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 5 (stage 2, block 2): 512 -> 51 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 6 (stage 2, block 3): 512 -> 51 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 7 (stage 2, block 4): 512 -> 51 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 8 (stage 3, block 1): 1280 -> 128 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 9 (stage 3, block 2): 1280 -> 128 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 10 (stage 3, block 3): 1280 -> 128 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 11 (stage 3, block 4): 1280 -> 128 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 12 (stage 3, block 5): 1280 -> 128 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 13 (stage 3, block 6): 1280 -> 128 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 14 (stage 4, block 1): 2048 -> 205 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 15 (stage 4, block 2): 2048 -> 205 expanded channels  [fc1, dwconv.dwconv, fc2]
+   block 16 (stage 4, block 3): 2048 -> 205 expanded channels  [fc1, dwconv.dwconv, fc2]
+   decoder projection 1 (from stage 1): 768 -> 77 channels
+   decoder projection 2 (from stage 2): 768 -> 77 channels
+   decoder projection 3 (from stage 3): 768 -> 77 channels
+   decoder projection 4 (from stage 4): 768 -> 77 channels
+   decoder fuse: 768 -> 77 channels
+   decoder layers that changed shape (weight shape before -> after):
+     decode_head.linear_projections.0.proj: (768, 64) -> (77, 64)
+     decode_head.linear_projections.1.proj: (768, 128) -> (77, 128)
+     decode_head.linear_projections.2.proj: (768, 320) -> (77, 320)
+     decode_head.linear_projections.3.proj: (768, 512) -> (77, 512)
+     decode_head.linear_fuse: (768, 3072, 1, 1) -> (77, 308, 1, 1)
+     decode_head.batch_norm: (768,) -> (77,)
+     decode_head.classifier: (150, 768, 1, 1) -> (150, 77, 1, 1)
+
