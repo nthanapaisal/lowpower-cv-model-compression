@@ -28,7 +28,7 @@ Files:
 - ./training/prune.py prune Segformer-B2 FP32
 - ./training/finetune.py finetune using subset training data (1000) from ADE20K -> onnx
 - ./training/export.py pruned + finetune -> onnx
-- ./training/evaluate.py evaluate models onnx (S0-S4)
+- ./training/evaluate.py evaluate models engines (S0-S4)
 - ./training/quantization.py quantize S0 - S4
 - ./training/distill.py
 
