@@ -4,8 +4,8 @@
 Commands (run from the repository root):
 
   python3 training/prune.py prune
-      Laptop or GPU machine. Loads SegFormer-B2 FP32 through load_model.py's
-      checkpoint and cache and builds a ladder of candidates that remove 10%,
+      Laptop or GPU machine. Reads training/model/segformer_b2.torchscript.pt
+      (written by load_model.py; --source to change) and builds a ladder of candidates that remove 10%,
       20%, ... (--step, up to --max-ratio) of the channels in each pruned layer.
       The ladder is cheap; the Jetson decides where to stop (see latency).
       For each candidate, in training/model/ (git-ignored):
@@ -216,15 +216,21 @@ def _resize_to(model, state_dict: dict) -> None:
 
 
 def load_checkpoint(path, checkpoint: str = B2_CHECKPOINT):
-    """Rebuild a (pruned, possibly fine-tuned) SegFormer from a .pth file.
+    """Rebuild a (pruned, possibly fine-tuned) SegFormer from a .pth or .torchscript.pt file.
 
-    Accepts a file written by save_checkpoint(), or a plain state_dict (keys may
+    Accepts a TorchScript file (from load_model.py, prune.py or finetune.py), a
+    file written by save_checkpoint(), or a plain state_dict (keys may
     start with "model." or "module."), in which case the architecture settings
     come from the original checkpoint's config.
     """
     import torch
     from transformers import AutoConfig, SegformerConfig, SegformerForSemanticSegmentation
-    saved = torch.load(str(path), map_location="cpu", weights_only=False)
+    if str(path).endswith(".torchscript.pt"):
+        # TorchScript files from load_model.py or finetune.py: take the weights,
+        # rebuild the model (Torch-Pruning needs the eager model, not a traced graph)
+        saved = dict(torch.jit.load(str(path), map_location="cpu").state_dict())
+    else:
+        saved = torch.load(str(path), map_location="cpu", weights_only=False)
     if isinstance(saved, dict) and "state_dict" in saved:
         state_dict = saved["state_dict"]
         config = SegformerConfig.from_dict(saved["config"]) if "config" in saved \
@@ -237,7 +243,17 @@ def load_checkpoint(path, checkpoint: str = B2_CHECKPOINT):
     model = SegformerForSemanticSegmentation(config)
     _resize_to(model, state_dict)
     model.load_state_dict(state_dict, strict=True)
-    return model.eval()
+    model.eval()
+    if str(path).endswith(".torchscript.pt"):
+        # The rebuilt model must reproduce the TorchScript file exactly.
+        example = torch.randn(1, 3, INPUT_SIZE, INPUT_SIZE)
+        with torch.inference_mode():
+            want = torch.jit.load(str(path), map_location="cpu")(example)
+            got = wrap(model)(example)
+        error = (want - got).abs().max().item() / (want.abs().max().item() or 1.0)
+        if error > 1e-4:
+            raise RuntimeError(f"Rebuilt model differs from {path} (relative error {error:.2e}).")
+    return model
 
 
 # ==========================================================================
@@ -913,8 +929,12 @@ def main() -> None:
                    help="explicit ratios instead of the ladder, e.g. to refine between two rungs")
     p.add_argument("--mlp-scale", type=float, default=1.0, help="multiplier on the ratio for the MLP layers")
     p.add_argument("--decoder-scale", type=float, default=1.0, help="multiplier on the ratio for the decoder")
-    p.add_argument("--start", type=Path, default=None, help="continue from a (fine-tuned) .pth checkpoint")
-    p.add_argument("--checkpoint", default=B2_CHECKPOINT, help="Hugging Face id or local folder (default: B2)")
+    p.add_argument("--source", type=Path, default=OUTPUT_DIR / "segformer_b2.torchscript.pt",
+                   help="unpruned model to prune (default: load_model.py's segformer_b2.torchscript.pt)")
+    p.add_argument("--start", type=Path, default=None,
+                   help="continue from a pruned (fine-tuned) .pth or .torchscript.pt instead")
+    p.add_argument("--checkpoint", default=B2_CHECKPOINT,
+                   help="where the architecture settings come from (Hugging Face id or folder; default: B2)")
     p.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
     p.add_argument("--prefix", default="segformer_b2")
     p.add_argument("--metrics-dir", type=Path, default=PROJECT_DIR,
@@ -957,9 +977,11 @@ def main() -> None:
         if args.start:
             print(f"Continuing from {args.start}", flush=True)
             model = load_checkpoint(args.start, args.checkpoint)
+        elif args.source.is_file():
+            print(f"Loading weights from {args.source}", flush=True)
+            model = load_checkpoint(args.source, args.checkpoint)
         else:
-            print(f"Loading {args.checkpoint}", flush=True)
-            model = load_original(args.checkpoint)
+            raise SystemExit(f"{args.source} not found. Run `python3 training/load_model.py` first.")
         save_preprocessing(args.checkpoint, args.output_dir)
         run_prune(model, args.ratios, args.mlp_scale, args.decoder_scale, args.output_dir,
                   prefix=args.prefix, start=str(args.start) if args.start else None, verify=not args.no_verify,

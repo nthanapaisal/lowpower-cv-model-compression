@@ -62,10 +62,10 @@ def find_data_root(path: Path) -> Path:
 
 
 def training_pairs(root: Path, list_path: Path | None) -> list[tuple[Path, Path]]:
-    if list_path is not None and list_path.is_file():
-        names = [line.strip() for line in list_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    else:
-        names = sorted(p.name for p in (root / "images" / "training").glob("*.jpg"))
+    if list_path is None or not list_path.is_file():
+        raise SystemExit(f"Training list {list_path} not found. Fine-tuning uses only the stratified subset "
+                         "from `python3 training/prune.py subset`.")
+    names = [line.strip() for line in list_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     pairs = [(root / "images" / "training" / n, root / "annotations" / "training" / (Path(n).stem + ".png"))
              for n in names]
     missing = [str(p) for pair in pairs for p in pair if not p.is_file()]
@@ -124,16 +124,16 @@ class SubsetDataset(Dataset):
         return pixels.contiguous(), labels.contiguous()
 
 
-def save_outputs(model, stem: Path, export: bool) -> list[Path]:
-    """TorchScript, state dict, and (optionally) ONNX for the fine-tuned model."""
+def save_outputs(model, stem: Path, onnx_path: Path | None) -> list[Path]:
+    """TorchScript, state dict, and (unless onnx_path is None) ONNX for the fine-tuned model."""
     model.eval()
     written = [Path(f"{stem}.torchscript.pt"), Path(f"{stem}.pth")]
     cpu = model.to("cpu")
     torch.jit.save(cpu, str(written[0]))
     torch.save({"state_dict": cpu.state_dict(), "meta": {"fine_tuned": True}}, str(written[1]))
-    if export:
+    if onnx_path is not None:
         from export import export_onnx
-        written.append(export_onnx(written[0], Path(f"{stem}.onnx")))
+        written.append(export_onnx(written[0], onnx_path))
     return written
 
 
@@ -152,6 +152,7 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=0, help="stop after this many images (timing runs)")
     parser.add_argument("--device", default=None, help="default: cuda if available, else cpu")
     parser.add_argument("--no-onnx", action="store_true", help="skip the ONNX export at the end")
+    parser.add_argument("--onnx", type=Path, default=None, help="ONNX output path (default: <name>_ft.onnx)")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -160,6 +161,7 @@ def main() -> None:
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     root = find_data_root(args.data)
     pairs = training_pairs(root, args.list)
+    print(f"Fine-tuning on {len(pairs)} images listed in {args.list} (stratified subset).", flush=True)
     preprocessing = load_preprocessing(args.model)
     if (int(preprocessing["height"]), int(preprocessing["width"])) != (SIZE, SIZE):
         raise SystemExit("Expected a 512x512 model.")
@@ -220,7 +222,7 @@ def main() -> None:
         writer = csv.DictWriter(stream, fieldnames=list(log[0]))
         writer.writeheader()
         writer.writerows(log)
-    written = save_outputs(model, stem, export=not args.no_onnx)
+    written = save_outputs(model, stem, None if args.no_onnx else (args.onnx or Path(f"{stem}.onnx")))
     print(f"Wall-clock training time: {(time.time() - started) / 60:.1f} min for {seen} images "
           f"({(time.time() - started) / max(seen, 1):.2f} s/image on {device}).")
     for path in written + [Path(f"{stem}_log.csv")]:
