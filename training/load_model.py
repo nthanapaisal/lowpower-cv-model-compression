@@ -16,7 +16,8 @@ import os
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = PROJECT_DIR / "model"
+REPO_DIR = PROJECT_DIR.parent
+OUTPUT_DIR = REPO_DIR / "model"
 HF_CACHE = PROJECT_DIR / ".cache" / "huggingface"
 os.environ["HF_HOME"] = str(HF_CACHE)
 os.environ["HF_HUB_CACHE"] = str(HF_CACHE / "hub")

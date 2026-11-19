@@ -17,7 +17,7 @@ import gc
 import json
 from pathlib import Path
 
-MODEL_DIR = Path(__file__).resolve().parent / "model"
+MODEL_DIR = Path(__file__).resolve().parent.parent / "model"
 MODEL_FILES = {
     "b0": "segformer_b0.torchscript.pt",
     "b1": "segformer_b1.torchscript.pt",

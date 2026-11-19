@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Export SegFormer models to fixed-shape ONNX for TensorRT (S0-S4).
 
-    python3 training/export.py training/model/segformer_b2_pruned40_ft.torchscript.pt
-    python3 training/export.py training/model/segformer_b2.torchscript.pt --fp16
+    python3 training/export.py model/segformer_b2_pruned40_ft.torchscript.pt
+    python3 training/export.py model/segformer_b2.torchscript.pt --fp16
 
 Input: a TorchScript file (from load_model.py, prune.py or finetune.py; needs
 PyTorch only) or a .pth checkpoint from prune.py/finetune.py (needs

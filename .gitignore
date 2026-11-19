@@ -2,3 +2,4 @@ ade20k-scene-parse-150/
 model/
 __pycache__/
 training/.cache/
+ade20k_subset.tar

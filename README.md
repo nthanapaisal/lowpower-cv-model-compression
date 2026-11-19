@@ -26,11 +26,14 @@ Files:
 ./training 
 - ./training/load_model.py to load models locally into ./model
 - ./training/prune.py prune Segformer-B2 FP32
-- ./training/finetune.py finetune using subset training data (1000) from ADE20K -> onnx
+- ./training/finetune.py finetune using subset training data (1000) from ADE20K, with before/after validation (no ONNX)
 - ./training/export.py pruned + finetune -> onnx
-- ./training/evaluate.py evaluate models onnx (S0-S4)
+- ./training/evaluate.py evaluate models on the Jetson (S0-S4), Nikki (on main)
 - ./training/quantization.py quantize S0 - S4
 - ./training/distill.py
+
+./model (git-ignored): all models: TorchScript, .pth, ONNX, TensorRT engines
+./results: metrics and other outputs (pruning_metrics.*, pruned_latency.csv, subset_train_1000.*, *_ft_log.csv, *_ft_eval.csv)
 
 Locally Existings Directories:
 - ./onnx
@@ -49,7 +52,7 @@ Before running on Jetson run these scripts below and paste them /output_txt:
 ---------------------------------------------------------------
 Flow:
 
-Luke: load_model.py -> (1) prune.py -> (2) finetune.py -> export.py -> evaluate.py
+Luke: load_model.py -> (1) prune.py -> (2) finetune.py -> export.py
 
 Nikki: load_model.py -> (1) quantization.py -> (2) export.py  -> (3) evaluate.py -> (4) distill.py -> evaluate.py
 

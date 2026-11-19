@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Structured pruning of SegFormer-B2. Everything pruning-related is in this file.
+"""
+Structured pruning of SegFormer-B2. Everything pruning-related is in this file.
 
 Commands (run from the repository root):
 
   python3 training/prune.py prune
-      Laptop or GPU machine. Reads training/model/segformer_b2.torchscript.pt
-      (written by load_model.py; --source to change) and builds a ladder of candidates that remove 10%,
-      20%, ... (--step, up to --max-ratio) of the channels in each pruned layer.
-      The ladder is cheap; the Jetson decides where to stop (see latency).
-      For each candidate, in training/model/ (git-ignored):
+      Laptop or GPU machine. Reads model/segformer_b2.torchscript.pt
+      (written by load_model.py) and builds a ladder of candidates that
+      remove 10%, 20%, ... (--step, up to --max-ratio) of the channels in each
+      pruned layer. The ladder is cheap; the Jetson decides where to stop (see latency).
+      For each candidate, in model/ (git-ignored):
         segformer_b2_prunedNN.pth             (for finetune.py, and --start below)
-        segformer_b2_prunedNN.torchscript.pt  (for timing in PyTorch on the Jetson)
-        segformer_b2_prunedNN.onnx            (for TensorRT engines, e.g. with lab1_trt.py)
-      and the metrics, in training/ (tracked by git):
+        segformer_b2_prunedNN.torchscript.pt  (for finetune.py's TorchScript training)
+        segformer_b2_prunedNN.onnx            (for TensorRT engines: latency sweep, Nikki's engines)
+      and the metrics, in results/ (tracked by git):
         pruning_metrics.txt   (before/after report: params, MACs, MiB, channels
                                kept, sparsity, changed layers per block)
         pruning_metrics.csv   (one row per model)
@@ -33,17 +34,20 @@ Commands (run from the repository root):
       the first candidate whose median P99 meets --target-ms, or earlier if two
       consecutive candidates differ in P99 by less than the spread between
       sessions: the unpruned layers then bound the latency, and more pruning
-      cannot reach the target.
-      Times the TorchScript files in PyTorch FP32. Needs: torch only. Energy is
-      NOT measured here: every reported energy number must come from
-      power_window.py (jetson/baseline.py).
+      cannot reach the target. The chosen ratio is saved to results/pruning_target.txt
+      (scripts/run_pipeline.sh --ratio auto reads it).
+      Times the ONNX files as TensorRT FP32 engines (--precision fp16 for FP16); the
+      engine is built once and cached next to the ONNX file as <name>.fp32.engine.
+      A *.torchscript.pt file given explicitly is timed in PyTorch FP32 instead. TF32 is off.
+      Needs: torch and tensorrt only. Energy is NOT measured here: every reported
+      energy number must come from power_window.py (baseline/baseline.py).
 
   python3 training/prune.py subset --zip ADEChallengeData2016.zip
       Picks 1000 of the 20,210 training images, stratified by which of the 150
       classes each image contains, and copies them plus the 2000 validation
       images into ade20k-scene-parse-150/ (the zip's layout), ready to copy to
       the Jetson or upload to Colab. The image names go to
-      training/subset_train_1000.txt. Needs: numpy, Pillow.
+      results/subset_train_1000.txt. Needs: numpy, Pillow.
 
 What is pruned (Section III of the proposal)
   * Whole channels (structured pruning): the result is a smaller dense model.
@@ -60,7 +64,9 @@ import copy
 import csv
 import gc
 import io
+import math
 import re
+import statistics
 import sys
 import time
 import zipfile
@@ -68,7 +74,8 @@ from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent
 REPO_DIR = PROJECT_DIR.parent
-OUTPUT_DIR = PROJECT_DIR / "model"
+OUTPUT_DIR = REPO_DIR / "model"        # models: TorchScript, .pth, ONNX, engines (git-ignored)
+RESULTS_DIR = REPO_DIR / "results"      # metrics and other outputs (tracked)
 sys.path.insert(0, str(PROJECT_DIR))
 from load_model import CHECKPOINTS  # noqa: E402  (also points the Hugging Face cache at training/.cache)
 
@@ -481,9 +488,7 @@ def channels(model) -> list[dict]:
     for target in find_targets(model):
         if target["kind"] == "mlp":
             counters["block"] = counters.get("block", 0) + 1
-            stage = target["stage"]
-            counters[stage] = counters.get(stage, 0) + 1
-            label = f"block {counters['block']} (stage {stage + 1}, block {counters[stage]})"
+            label = f"block {counters['block']}"
         elif target["name"].endswith("linear_fuse"):
             label = "decoder fuse"
         else:
@@ -511,18 +516,21 @@ def measure(model, reference_shapes: dict | None = None) -> dict:
 
 
 def _block_lines(result: dict) -> list[str]:
-    """One line per pruned block, in the requested format, plus the layers that changed in it."""
+    """One line per pruned block ("block 2: 96 -> 96 expanded channels"), then the layers that changed."""
     changed = result["changed_layers"]
     lines = []
+    mlp_layers: list[str] = []
+    last_block = 0
     for w in result["widths"]:
         unit = "expanded channels" if w["kind"] == "mlp" else "channels"
-        if w["kind"] == "mlp":
+        if w["kind"] == "mlp" and not mlp_layers:
             prefix = w["name"].rsplit(".", 1)[0] + "."
-            touched = [n[len(prefix):] for n, _, _ in changed if n.startswith(prefix)]
-            detail = f"  [{', '.join(touched)}]" if touched else ""
-        else:
-            detail = ""
-        lines.append(f"{w['label']}: {w['original']} -> {w['kept']} {unit}{detail}")
+            mlp_layers = [n[len(prefix):] for n, _, _ in changed if n.startswith(prefix)]
+        lines.append(f"{w['label']}: {w['original']} -> {w['kept']} {unit}")
+        if w["kind"] == "mlp":
+            last_block = len(lines)
+    if mlp_layers:
+        lines.insert(last_block, f"layers changed in every block above: {', '.join(mlp_layers)}")
     decoder = [(n, old, new) for n, old, new in changed if n.startswith("decode_head")]
     if decoder:
         lines.append("decoder layers that changed shape (weight shape before -> after):")
@@ -622,7 +630,8 @@ def run_prune(model, ratios, mlp_scale: float, decoder_scale: float, output_dir:
         results.append(result)
         print(f"{name}: {result['params'] / 1e6:.2f} M params, {result['macs_g']:.2f} G MACs, "
               f"{result['size_mib']:.1f} MiB, self-check {'passed' if verify else 'skipped'}", flush=True)
-    metrics_dir = metrics_dir or PROJECT_DIR
+    metrics_dir = metrics_dir or RESULTS_DIR
+    metrics_dir.mkdir(parents=True, exist_ok=True)
     stem = "pruning_metrics" + (f"_from_{Path(start).stem}" if start else "") + (f"_{tag}" if tag else "")
     write_metrics(results, metrics_dir / f"{stem}.txt", metrics_dir / f"{stem}.csv", note)
     print(f"Metrics: {metrics_dir / (stem + '.txt')} and {stem}.csv", flush=True)
@@ -633,40 +642,131 @@ def run_prune(model, ratios, mlp_scale: float, decoder_scale: float, output_dir:
 # Latency on the Jetson
 # ==========================================================================
 
-def measure_latency(path, device: str = "cuda", warmup_seconds: float = 2.0, iterations: int = 1000) -> dict:
-    """Course protocol: batch 1, 512x512, warm-up excluded, GPU-synchronized timing."""
-    import numpy as np
+def _engine_path(onnx_path: Path, precision: str) -> Path:
+    """Engine cache file next to the ONNX file."""
+    return onnx_path.with_suffix(f".{precision}.engine")
+
+
+def build_engine(onnx_path: Path, precision: str):
+    """TensorRT engine from an ONNX file, cached next to it as <name>.<precision>.engine.
+
+    tensorrt only (TensorRT 10, the version in the lpcv container). Built once, not timed.
+    """
+    import tensorrt as trt
+    logger = trt.Logger(trt.Logger.WARNING)
+    runtime = trt.Runtime(logger)
+    cached = _engine_path(onnx_path, precision)
+    if cached.is_file() and cached.stat().st_mtime >= onnx_path.stat().st_mtime:
+        return runtime.deserialize_cuda_engine(cached.read_bytes()), runtime
+    print(f"Building a TensorRT {precision.upper()} engine from {onnx_path.name} (a few minutes)", flush=True)
+    builder = trt.Builder(logger)
+    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    parser = trt.OnnxParser(network, logger)
+    if not parser.parse(onnx_path.read_bytes()):
+        errors = "; ".join(str(parser.get_error(i)) for i in range(parser.num_errors))
+        raise RuntimeError(f"Could not read ONNX model {onnx_path}: {errors}")
+    config = builder.create_builder_config()
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)
+    if precision == "fp16":
+        config.set_flag(trt.BuilderFlag.FP16)
+    serialized = builder.build_serialized_network(network, config)
+    if serialized is None:
+        raise RuntimeError(f"TensorRT could not build an engine for {onnx_path}")
+    cached.write_bytes(bytes(serialized))
+    return runtime.deserialize_cuda_engine(serialized), runtime
+
+
+def _params_from_metrics(path: Path) -> int | None:
+    """Parameter count of a candidate, read from results/pruning_metrics.csv (None if not listed)."""
+    csv_path = RESULTS_DIR / "pruning_metrics.csv"
+    if not csv_path.is_file():
+        return None
+    with csv_path.open(newline="", encoding="utf-8") as stream:
+        for row in csv.DictReader(stream):
+            if path.name in (row.get("onnx_file"), row.get("torchscript_file")) or \
+                    (row["model"].startswith("segformer_b2 (unpruned)") and _ratio_of(path) == 0.0):
+                return int(row["params"])
+    return None
+
+
+def measure_latency(path, device: str = "cuda", warmup_seconds: float = 2.0, iterations: int = 1000,
+                    precision: str = "fp32") -> dict:
+    """Course protocol: batch 1, 512x512, 2 s warm-up excluded, GPU-synchronized timing.
+
+    *.onnx          TensorRT engine at `precision` (default FP32, like the models).
+    *.torchscript.pt  PyTorch FP32 (the Milestone 1 baseline runtime).
+    Only torch, tensorrt and the standard library (the Jetson container has nothing else we may use).
+    TF32 is switched off so the FP32 numbers are real FP32.
+    """
     import torch
+    path = Path(path)
     if device == "cuda" and not torch.cuda.is_available():
         raise SystemExit("CUDA is not available. Run the latency sweep on the Jetson.")
-    model = torch.jit.load(str(path), map_location=device).eval()
-    image = torch.randn(1, 3, INPUT_SIZE, INPUT_SIZE, device=device)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 
     def sync():
         if device == "cuda":
             torch.cuda.synchronize()
 
+    if path.suffix == ".onnx":
+        import tensorrt as trt
+        engine, runtime = build_engine(path, precision)
+        context = engine.create_execution_context()
+        names = [engine.get_tensor_name(i) for i in range(engine.num_io_tensors)]
+        in_name = next(n for n in names if engine.get_tensor_mode(n) == trt.TensorIOMode.INPUT)
+        out_name = next(n for n in names if engine.get_tensor_mode(n) == trt.TensorIOMode.OUTPUT)
+        types = {trt.DataType.FLOAT: torch.float32, trt.DataType.HALF: torch.float16}
+        image = torch.randn(1, 3, INPUT_SIZE, INPUT_SIZE, device=device,
+                            dtype=types[engine.get_tensor_dtype(in_name)]).contiguous()
+        context.set_input_shape(in_name, tuple(image.shape))
+        logits = torch.empty(tuple(context.get_tensor_shape(out_name)), device=device,
+                             dtype=types[engine.get_tensor_dtype(out_name)])
+        context.set_tensor_address(in_name, image.data_ptr())
+        context.set_tensor_address(out_name, logits.data_ptr())
+        side_stream = torch.cuda.Stream()   # TensorRT warns about the default stream (extra synchronization)
+        stream = side_stream.cuda_stream
+        torch.cuda.synchronize()            # the input tensor is ready before the side stream reads it
+
+        def infer():
+            context.execute_async_v3(stream)
+
+        label, params = f"TensorRT {precision.upper()}", _params_from_metrics(path)
+    else:
+        model = torch.jit.load(str(path), map_location=device).eval()
+        image = torch.randn(1, 3, INPUT_SIZE, INPUT_SIZE, device=device)
+
+        def infer():
+            model(image)
+
+        label, params = "PyTorch FP32", sum(p.numel() for p in model.parameters())
+
     with torch.inference_mode():
         start = time.perf_counter()
         while time.perf_counter() - start < warmup_seconds:
-            model(image)
+            infer()
             sync()
         timings = []
         for _ in range(iterations):
             sync()
             began = time.perf_counter()
-            model(image)
+            infer()
             sync()
             timings.append((time.perf_counter() - began) * 1000.0)
-    values = np.asarray(timings)
-    result = {"params": sum(p.numel() for p in model.parameters()), "mean_ms": float(values.mean()),
-              "p50_ms": float(np.percentile(values, 50)), "p99_ms": float(np.percentile(values, 99)),
-              "fps": float(1000.0 / values.mean())}
-    del model
+    mean = sum(timings) / len(timings)
+    result = {"runtime": label, "params": params, "mean_ms": mean,
+              "p50_ms": statistics.median(timings), "p99_ms": nearest_rank(timings, 99),
+              "fps": 1000.0 / mean}
     gc.collect()
     if device == "cuda":
         torch.cuda.empty_cache()
     return result
+
+
+def nearest_rank(values, percent: float) -> float:
+    """Nearest-rank percentile, as the course benchmark does: P99 of 1000 runs is the 990th smallest."""
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(percent / 100.0 * len(ordered)) - 1)]
 
 
 def _ratio_of(path) -> float:
@@ -712,36 +812,40 @@ def stopping_decision(rows: list[dict], target_ms: float) -> str | None:
 
 
 def run_latency(files: list[Path], target_ms: float, device: str, iterations: int, sessions: int,
-                cooldown: float, output: Path, stop: bool = True) -> list[dict]:
+                cooldown: float, output: Path, stop: bool = True, precision: str = "fp32") -> list[dict]:
     """Measure candidates in order (least pruned first) and apply the stopping rule."""
-    import numpy as np
     rows, decision = [], None
     for index, path in enumerate(files):
         p99s, p50s, fps = [], [], []
         for session in range(sessions):
             print(f"Measuring {path.name}, session {session + 1}/{sessions}", flush=True)
-            result = measure_latency(path, device=device, iterations=iterations)
+            result = measure_latency(path, device=device, iterations=iterations, precision=precision)
             p99s.append(result["p99_ms"]), p50s.append(result["p50_ms"]), fps.append(result["fps"])
             if cooldown > 0:
                 time.sleep(cooldown)
-        rows.append({"model": path.name, "params": result["params"],
-                     "p50_ms": round(float(np.median(p50s)), 3), "p99_ms": round(float(np.median(p99s)), 3),
-                     "spread_ms": round(max(p99s) - min(p99s), 3), "fps": round(float(np.median(fps)), 3),
+        rows.append({"model": path.name, "runtime": result["runtime"], "params": result["params"] or "",
+                     "p50_ms": round(statistics.median(p50s), 3), "p99_ms": round(statistics.median(p99s), 3),
+                     "spread_ms": round(max(p99s) - min(p99s), 3), "fps": round(statistics.median(fps), 3),
                      "p99_sessions_ms": " ".join(f"{v:.3f}" for v in p99s), "target_ms": target_ms,
-                     "meets_target": float(np.median(p99s)) <= target_ms})
+                     "meets_target": statistics.median(p99s) <= target_ms})
         decision = stopping_decision(rows, target_ms)
         if stop and decision:
             break
+    output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
     print(f"\n{'model':<44}{'params (M)':>11}{'P50 ms':>9}{'P99 ms':>9}{'spread':>8}{'FPS':>8}  <= {target_ms:g} ms")
     for row in rows:
-        print(f"{row['model']:<44}{row['params'] / 1e6:>11.2f}{row['p50_ms']:>9.2f}{row['p99_ms']:>9.2f}"
+        print(f"{row['model']:<44}{(row['params'] or 0) / 1e6:>11.2f}{row['p50_ms']:>9.2f}{row['p99_ms']:>9.2f}"
               f"{row['spread_ms']:>8.2f}{row['fps']:>8.2f}  {'yes' if row['meets_target'] else 'no'}")
     if decision == "target":
         print(f"\nPruning target: {rows[-1]['model']} is the least pruned candidate under {target_ms:g} ms.")
+        target_file = output.with_name("pruning_target.txt")   # read by scripts/run_pipeline.sh --ratio auto
+        target_file.write_text(f"{_ratio_of(rows[-1]['model']):g}\n", encoding="utf-8")
+        print(f"Chosen ratio {_ratio_of(rows[-1]['model']):g} saved to {target_file} "
+              f"(scripts/run_pipeline.sh --ratio auto uses it).")
         nxt = refine_suggestion(rows, target_ms)
         if nxt is not None:
             print(f"Refine: python3 training/prune.py prune --ratios {nxt}   (then run latency again)")
@@ -900,6 +1004,7 @@ def run_subset(zip_path: Path, size: int, seed: int, out_dir: Path, list_path: P
     chosen = stratified_subset(presence, size, seed)
     balance = subset_balance(presence, chosen)
     chosen_images = [images[i] for i in chosen]
+    list_path.parent.mkdir(parents=True, exist_ok=True)
     list_path.write_text("".join(Path(name).name + "\n" for name in chosen_images), encoding="utf-8")
     with (list_path.with_suffix(".classes.csv")).open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
@@ -937,19 +1042,21 @@ def main() -> None:
                    help="where the architecture settings come from (Hugging Face id or folder; default: B2)")
     p.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
     p.add_argument("--prefix", default="segformer_b2")
-    p.add_argument("--metrics-dir", type=Path, default=PROJECT_DIR,
-                   help="where pruning_metrics.txt/.csv go (default: training/, tracked by git)")
+    p.add_argument("--metrics-dir", type=Path, default=RESULTS_DIR,
+                   help="where pruning_metrics.txt/.csv go (default: results/, tracked by git)")
     p.add_argument("--no-verify", action="store_true", help="skip the self-check")
 
-    l = commands.add_parser("latency", help="Jetson: P99 latency of the TorchScript candidates")
+    l = commands.add_parser("latency", help="Jetson: P99 latency of the candidates (TensorRT FP32 from ONNX)")
     l.add_argument("models", nargs="*", type=Path)
     l.add_argument("--target-ms", type=float, default=50.0)
     l.add_argument("--iterations", type=int, default=1000)
     l.add_argument("--sessions", type=int, default=3, help="separate timing sessions per model")
     l.add_argument("--cooldown", type=float, default=60.0, help="seconds between sessions")
     l.add_argument("--no-stop", action="store_true", help="measure every file instead of stopping early")
+    l.add_argument("--precision", choices=("fp16", "fp32"), default="fp32",
+                   help="TensorRT engine precision for .onnx files (default fp32)")
     l.add_argument("--device", default="cuda")
-    l.add_argument("--output", type=Path, default=Path("pruned_latency.csv"))
+    l.add_argument("--output", type=Path, default=RESULTS_DIR / "pruned_latency.csv")
 
     o = commands.add_parser("onnx", help="export a .pth checkpoint (e.g. the fine-tuned model) to ONNX")
     o.add_argument("checkpoint_file", type=Path)
@@ -961,7 +1068,7 @@ def main() -> None:
     s.add_argument("--size", type=int, default=1000)
     s.add_argument("--seed", type=int, default=0)
     s.add_argument("--out", type=Path, default=REPO_DIR / "ade20k-scene-parse-150")
-    s.add_argument("--list", type=Path, default=PROJECT_DIR / "subset_train_1000.txt")
+    s.add_argument("--list", type=Path, default=RESULTS_DIR / "subset_train_1000.txt")
     s.add_argument("--time-budget", type=float, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -987,14 +1094,13 @@ def main() -> None:
                   prefix=args.prefix, start=str(args.start) if args.start else None, verify=not args.no_verify,
                   metrics_dir=args.metrics_dir, tag=tag)
     elif args.command == "latency":
-        pattern = re.compile(r"segformer_b2(_pruned\d+)?\.torchscript\.pt$")   # not *_ft files
-        found = {p for d in (REPO_DIR / "model", OUTPUT_DIR) for p in d.glob("segformer_b2*.torchscript.pt")
-                 if pattern.fullmatch(p.name)}
+        pattern = re.compile(r"segformer_b2(_pruned\d+)?\.onnx")   # not *_ft files
+        found = [p for p in OUTPUT_DIR.glob("segformer_b2*.onnx") if pattern.fullmatch(p.name)]
         files = args.models or sorted(found, key=_ratio_of)
         if not files:
-            parser.error("No segformer_b2*.torchscript.pt files found in model/ or training/model/.")
+            parser.error("No segformer_b2*.onnx files found in model/.")
         run_latency(files, args.target_ms, args.device, args.iterations, args.sessions, args.cooldown,
-                    args.output, stop=not args.no_stop)
+                    args.output, stop=not args.no_stop, precision=args.precision)
     elif args.command == "onnx":
         model = load_checkpoint(args.checkpoint_file, args.checkpoint)
         output = args.output or args.checkpoint_file.with_suffix(".onnx")

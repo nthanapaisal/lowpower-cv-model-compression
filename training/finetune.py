@@ -6,9 +6,9 @@ channels take over the lost work. It trains the TorchScript file that
 prune.py writes, so it needs PyTorch only (no Transformers): it runs on a
 GPU machine (Colab) or on a Jetson training board.
 
-    python3 training/finetune.py training/model/segformer_b2_pruned40.torchscript.pt
+    python3 training/finetune.py model/segformer_b2_pruned40.torchscript.pt
 
-Defaults follow the plan: the 1000 images listed in training/subset_train_1000.txt,
+Defaults follow the plan: the 1000 images listed in results/subset_train_1000.txt,
 10 epochs, batch size 1 with gradients accumulated over 8 images (the Jetson's
 memory allows only batch 1-2 at 512x512), AdamW at 6e-5 with linear decay.
 For a short round between pruning steps use --epochs 1.
@@ -16,8 +16,8 @@ For a short round between pruning steps use --epochs 1.
 Writes, next to the input model:
     <name>_ft.torchscript.pt   for latency and evaluate.py
     <name>_ft.pth              state dict, for prune.py --start (next pruning step)
-    <name>_ft.onnx             unless --no-onnx (export.py does the same later)
-    <name>_ft_log.csv          loss and wall-clock time per epoch
+    results/<name>_ft_log.csv  loss, wall-clock time per epoch, and the GPU used
+No ONNX here: export is its own step (python3 training/export.py <name>_ft.torchscript.pt).
 
 Preprocessing matches the evaluation: images are scaled to [0, 1] and normalized
 with the mean and std in preprocessing.json; labels 1-150 become classes 0-149
@@ -25,8 +25,17 @@ and 0 ("other") is ignored. Training adds random scaling (0.5-2.0x), a random
 512x512 crop and horizontal flips. BatchNorm and dropout stay as they were
 traced (inference mode), which keeps BatchNorm statistics stable at batch 1.
 
+Before and after training it also runs an evaluate-only pass over the first 2000
+validation images and prints Top-1 pixel accuracy and correct/total labeled
+pixels, so the recovery is visible (saved to results/<name>_ft_eval.csv). The
+validation images are never used for training: the training list holds only
+images/training files. No energy, latency or mIoU is measured here; that is
+evaluate.py on the Jetson. The evaluation reuses baseline/baseline.py, so the
+numbers are computed exactly as evaluate.py computes them, and it reads
+./ade20k-scene-parse-150/images/validation (scripts/sync_subset.sh --val).
+
 Time 20 steps before a full run, to give the wall-clock estimate:
-    python3 training/finetune.py <model> --max-steps 20 --no-onnx
+    python3 training/finetune.py <model> --max-steps 20 --no-eval
 """
 
 from __future__ import annotations
@@ -36,6 +45,7 @@ import csv
 import json
 import math
 import random
+import sys
 import time
 from pathlib import Path
 
@@ -47,7 +57,8 @@ from torch.utils.data import DataLoader, Dataset
 PROJECT_DIR = Path(__file__).resolve().parent
 REPO_DIR = PROJECT_DIR.parent
 DEFAULT_DATA = REPO_DIR / "ade20k-scene-parse-150"
-DEFAULT_LIST = PROJECT_DIR / "subset_train_1000.txt"
+RESULTS_DIR = REPO_DIR / "results"
+DEFAULT_LIST = RESULTS_DIR / "subset_train_1000.txt"
 NUM_CLASSES = 150
 IGNORE = 255
 SIZE = 512
@@ -66,6 +77,10 @@ def training_pairs(root: Path, list_path: Path | None) -> list[tuple[Path, Path]
         raise SystemExit(f"Training list {list_path} not found. Fine-tuning uses only the stratified subset "
                          "from `python3 training/prune.py subset`.")
     names = [line.strip() for line in list_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    leaked = [n for n in names if "_val_" in n or "validation" in n]
+    if leaked:
+        raise SystemExit(f"{len(leaked)} names in {list_path} look like validation images (first: {leaked[0]}). "
+                         "Validation images are for evaluation only, never for fine-tuning.")
     pairs = [(root / "images" / "training" / n, root / "annotations" / "training" / (Path(n).stem + ".png"))
              for n in names]
     missing = [str(p) for pair in pairs for p in pair if not p.is_file()]
@@ -75,8 +90,7 @@ def training_pairs(root: Path, list_path: Path | None) -> list[tuple[Path, Path]
 
 
 def load_preprocessing(model_path: Path) -> dict:
-    for candidate in (model_path.parent / "preprocessing.json", PROJECT_DIR / "model" / "preprocessing.json",
-                      REPO_DIR / "model" / "preprocessing.json"):
+    for candidate in (model_path.parent / "preprocessing.json", REPO_DIR / "model" / "preprocessing.json"):
         if candidate.is_file():
             return json.loads(candidate.read_text(encoding="utf-8"))
     raise SystemExit("preprocessing.json not found next to the model. Run load_model.py or prune.py first.")
@@ -124,16 +138,37 @@ class SubsetDataset(Dataset):
         return pixels.contiguous(), labels.contiguous()
 
 
-def save_outputs(model, stem: Path, onnx_path: Path | None) -> list[Path]:
-    """TorchScript, state dict, and (unless onnx_path is None) ONNX for the fine-tuned model."""
+def evaluate_val(model, device, model_path: Path, limit: int, stage: str) -> dict:
+    """Evaluate only, never train: Top-1 pixel accuracy and correct/total on the first `limit` validation images.
+
+    Reuses baseline/baseline.py (the code evaluate.py runs on the Jetson), so the numbers are
+    computed the same way: the 512x512 input, logits upsampled to the label size, label 0 ignored.
+    """
+    sys.path.insert(0, str(REPO_DIR / "baseline"))
+    import baseline as bl
+    was_training = model.training
+    model.eval()
+    dataset = bl.load_evaluation_dataset(bl.DATASET_ID, num_images=limit)
+    processor = bl._load_processor(str(model_path))    # preprocessing.json next to the model
+    result = bl.evaluate_accuracy(model, dataset, processor, device)
+    model.train(was_training)
+    confusion = result["confusion_matrix"]
+    correct, total = int(confusion.trace()), int(confusion.sum())
+    row = {"stage": stage, "model": model_path.name, "images": result["num_images"],
+           "top1_pixel_accuracy_percent": round(100.0 * correct / total, 3),
+           "correct_pixels": correct, "labeled_pixels": total}
+    print(f"Validation, {stage} ({row['images']} images): Top-1 {row['top1_pixel_accuracy_percent']:.2f}%  "
+          f"(correct/total = {correct:,} / {total:,} labeled pixels)", flush=True)
+    return row
+
+
+def save_outputs(model, stem: Path) -> list[Path]:
+    """TorchScript and state dict of the fine-tuned model (ONNX is export.py's job)."""
     model.eval()
     written = [Path(f"{stem}.torchscript.pt"), Path(f"{stem}.pth")]
     cpu = model.to("cpu")
     torch.jit.save(cpu, str(written[0]))
     torch.save({"state_dict": cpu.state_dict(), "meta": {"fine_tuned": True}}, str(written[1]))
-    if onnx_path is not None:
-        from export import export_onnx
-        written.append(export_onnx(written[0], onnx_path))
     return written
 
 
@@ -151,8 +186,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=0, help="stop after this many images (timing runs)")
     parser.add_argument("--device", default=None, help="default: cuda if available, else cpu")
-    parser.add_argument("--no-onnx", action="store_true", help="skip the ONNX export at the end")
-    parser.add_argument("--onnx", type=Path, default=None, help="ONNX output path (default: <name>_ft.onnx)")
+    parser.add_argument("--no-eval", action="store_true",
+                        help="skip the before/after validation pass (timing runs)")
+    parser.add_argument("--val-limit", type=int, default=2000, help="validation images for the before/after pass")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -166,6 +202,8 @@ def main() -> None:
     if (int(preprocessing["height"]), int(preprocessing["width"])) != (SIZE, SIZE):
         raise SystemExit("Expected a 512x512 model.")
 
+    gpu = torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu"
+    print(f"Training device: {gpu}", flush=True)
     model = torch.jit.load(str(args.model), map_location=device)
     model.train()
     parameters = [p for p in model.parameters() if p.requires_grad]
@@ -183,6 +221,9 @@ def main() -> None:
     criterion = nn.CrossEntropyLoss(ignore_index=IGNORE)
 
     stem = args.model.parent / (args.model.name.replace(".torchscript.pt", "") + "_ft")
+    evals = []
+    if not args.no_eval:
+        evals.append(evaluate_val(model, device, args.model, args.val_limit, "before fine-tuning"))
     log, seen, started = [], 0, time.time()
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(1, args.epochs + 1):
@@ -211,21 +252,37 @@ def main() -> None:
             optimizer.step()
             schedule.step()
             optimizer.zero_grad(set_to_none=True)
-        log.append({"epoch": epoch, "images": seen, "train_loss": round(running / max(batches, 1), 4),
+        log.append({"epoch": epoch, "gpu": gpu, "images": seen, "train_loss": round(running / max(batches, 1), 4),
                     "epoch_minutes": round((time.time() - epoch_start) / 60, 2),
                     "total_minutes": round((time.time() - started) / 60, 2)})
         print(f"Epoch {epoch}: loss {log[-1]['train_loss']}, {log[-1]['epoch_minutes']} min", flush=True)
         if seen >= total_images:
             break
 
-    with Path(f"{stem}_log.csv").open("w", newline="", encoding="utf-8") as stream:
+    trained_seconds = time.time() - started
+    log_path = RESULTS_DIR / f"{stem.name}_log.csv"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(log[0]))
         writer.writeheader()
         writer.writerows(log)
-    written = save_outputs(model, stem, None if args.no_onnx else (args.onnx or Path(f"{stem}.onnx")))
-    print(f"Wall-clock training time: {(time.time() - started) / 60:.1f} min for {seen} images "
-          f"({(time.time() - started) / max(seen, 1):.2f} s/image on {device}).")
-    for path in written + [Path(f"{stem}_log.csv")]:
+    if not args.no_eval:
+        evals.append(evaluate_val(model, device, args.model, args.val_limit, "after fine-tuning"))
+        eval_path = RESULTS_DIR / f"{stem.name}_eval.csv"
+        with eval_path.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(evals[0]))
+            writer.writeheader()
+            writer.writerows(evals)
+        before, after = evals
+        print(f"Recovery on {after['images']} validation images: Top-1 {before['top1_pixel_accuracy_percent']:.2f}% -> "
+              f"{after['top1_pixel_accuracy_percent']:.2f}% "
+              f"({after['top1_pixel_accuracy_percent'] - before['top1_pixel_accuracy_percent']:+.2f} points); "
+              f"correct {before['correct_pixels']:,} -> {after['correct_pixels']:,} of "
+              f"{after['labeled_pixels']:,} labeled pixels", flush=True)
+    written = save_outputs(model, stem)
+    print(f"Wall-clock training time: {trained_seconds / 60:.1f} min for {seen} images "
+          f"({trained_seconds / max(seen, 1):.2f} s/image on {gpu}).")
+    for path in written + [log_path] + ([eval_path] if not args.no_eval else []):
         print(f"Saved {path}")
 
 
