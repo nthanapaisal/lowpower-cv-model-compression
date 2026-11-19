@@ -1,0 +1,8 @@
+model,runtime,params,p50_ms,p99_ms,spread_ms,fps,p99_sessions_ms,target_ms,meets_target
+segformer_b2_pruned10.onnx,TensorRT FP32,,94.256,95.32,0.136,10.606,95.198 95.320 95.335,50.0,False
+segformer_b2_pruned20.onnx,TensorRT FP32,,81.347,81.862,0.112,12.317,81.862 81.760 81.872,50.0,False
+segformer_b2_pruned30.onnx,TensorRT FP32,,76.025,76.594,0.064,13.167,76.531 76.594 76.596,50.0,False
+segformer_b2_pruned40.onnx,TensorRT FP32,,68.276,68.853,0.095,14.671,68.860 68.764 68.853,50.0,False
+segformer_b2_pruned50.onnx,TensorRT FP32,,55.963,56.654,0.124,17.86,56.562 56.686 56.654,50.0,False
+segformer_b2_pruned60.onnx,TensorRT FP32,,54.64,55.307,0.17,18.294,55.423 55.307 55.252,50.0,False
+segformer_b2_pruned70.onnx,TensorRT FP32,,47.09,47.64,0.419,21.201,47.640 47.976 47.556,50.0,True

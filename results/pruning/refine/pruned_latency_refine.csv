@@ -1,0 +1,5 @@
+model,runtime,params,p50_ms,p99_ms,spread_ms,fps,p99_sessions_ms,target_ms,meets_target
+segformer_b2_pruned62.onnx,TensorRT FP32,,53.152,53.694,0.0,18.801,53.694,50.0,False
+segformer_b2_pruned64.onnx,TensorRT FP32,,50.484,51.143,0.0,19.772,51.143,50.0,False
+segformer_b2_pruned66.onnx,TensorRT FP32,,51.914,52.684,0.0,19.233,52.684,50.0,False
+segformer_b2_pruned68.onnx,TensorRT FP32,,49.097,49.873,0.0,20.351,49.873,50.0,True

@@ -1,0 +1,11 @@
+epoch,gpu,images,train_loss,epoch_minutes,total_minutes
+1,Tesla T4,1000,2.4791,2.02,2.02
+2,Tesla T4,2000,nan,2.03,4.05
+3,Tesla T4,3000,nan,2.02,6.07
+4,Tesla T4,4000,nan,2.02,8.1
+5,Tesla T4,5000,1.0848,2.01,10.11
+6,Tesla T4,6000,nan,2.02,12.13
+7,Tesla T4,7000,0.9209,2.02,14.15
+8,Tesla T4,8000,0.8694,2.02,16.18
+9,Tesla T4,9000,0.8384,2.02,18.2
+10,Tesla T4,10000,0.8173,2.02,20.22
