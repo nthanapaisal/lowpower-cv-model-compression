@@ -1,0 +1,2 @@
+epoch,gpu,images,train_loss,epoch_minutes,total_minutes
+1,Tesla T4,20,2.2786,0.13,0.13
