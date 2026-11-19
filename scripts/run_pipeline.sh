@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One pruning ratio, start to finish. Run on Colab or a GPU machine; this only
-# prepares the model for Nikki, who deploys and measures it on the Jetson.
+# prepares the model for deployment and measurement on the Jetson.
 #
 #   prune -> finetune -> export to ONNX
 #
@@ -61,7 +61,7 @@ run() {
   step "1/3 prune to $RATIO"                          python3 training/prune.py prune --ratios "$RATIO"
   step "2/3 fine-tune (1000 train images) + val before/after"  python3 training/finetune.py "$PRUNED" "${FT_EXTRA[@]}"
   step "3/3 export fine-tuned model to ONNX"           python3 training/export.py "$TUNED"
-  echo; echo "Done. Hand to Nikki (Jetson):  $MODEL_DIR/segformer_b2_pruned${NN}_ft.onnx"
+  echo; echo "Done. Model for the Jetson:  $MODEL_DIR/segformer_b2_pruned${NN}_ft.onnx"
 }
 
 if [[ "$DRY" -eq 1 ]]; then

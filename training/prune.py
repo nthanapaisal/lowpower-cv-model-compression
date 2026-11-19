@@ -12,7 +12,7 @@ Commands (run from the repository root):
       For each candidate, in model/ (git-ignored):
         segformer_b2_prunedNN.pth             (for finetune.py, and --start below)
         segformer_b2_prunedNN.torchscript.pt  (for finetune.py's TorchScript training)
-        segformer_b2_prunedNN.onnx            (for TensorRT engines: latency sweep, Nikki's engines)
+        segformer_b2_prunedNN.onnx            (for TensorRT engines: latency sweep, quantization engines)
       and the metrics, in results/ (tracked by git):
         pruning_metrics.txt   (before/after report: params, MACs, MiB, channels
                                kept, sparsity, changed layers per block)
