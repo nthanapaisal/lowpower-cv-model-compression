@@ -1,5 +1,7 @@
 ade20k-scene-parse-150/
-model/
+model/*
+!model/segformer_b2_pruned68_ft.onnx
+!model/segformer_b2_pruned68_ft.pth
 __pycache__/
 training/.cache/
 ade20k_subset.tar
