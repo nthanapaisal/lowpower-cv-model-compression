@@ -156,9 +156,10 @@ def evaluate_val(model, device, model_path: Path, limit: int, stage: str) -> dic
     correct, total = int(confusion.trace()), int(confusion.sum())
     row = {"stage": stage, "model": model_path.name, "images": result["num_images"],
            "top1_pixel_accuracy_percent": round(100.0 * correct / total, 3),
-           "correct_pixels": correct, "labeled_pixels": total}
+           "correct_pixels": correct, "labeled_pixels": total,
+           "mean_iou_percent": round(float(result["mean_iou_percent"]), 3)}
     print(f"Validation, {stage} ({row['images']} images): Top-1 {row['top1_pixel_accuracy_percent']:.2f}%  "
-          f"(correct/total = {correct:,} / {total:,} labeled pixels)", flush=True)
+          f"(correct/total = {correct:,} / {total:,} labeled pixels), mIoU {row['mean_iou_percent']:.2f}%", flush=True)
     return row
 
 
@@ -189,12 +190,30 @@ def main() -> None:
     parser.add_argument("--no-eval", action="store_true",
                         help="skip the before/after validation pass (timing runs)")
     parser.add_argument("--val-limit", type=int, default=2000, help="validation images for the before/after pass")
+    parser.add_argument("--eval-only", action="store_true",
+                        help="only score the given model (.torchscript.pt or .pth) on the validation images: "
+                             "no training, no model files written")
     args = parser.parse_args()
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    if args.eval_only:
+        if args.model.name.endswith(".torchscript.pt"):
+            model = torch.jit.load(str(args.model), map_location=device)
+        else:
+            from prune import load_checkpoint
+            model = load_checkpoint(args.model).to(device)
+        row = evaluate_val(model, device, args.model, args.val_limit, "evaluation only")
+        out = RESULTS_DIR / f"{args.model.name.split('.')[0]}_eval_only.csv"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(row))
+            writer.writeheader()
+            writer.writerow(row)
+        print(f"Saved {out}")
+        return
     root = find_data_root(args.data)
     pairs = training_pairs(root, args.list)
     print(f"Fine-tuning on {len(pairs)} images listed in {args.list} (stratified subset).", flush=True)
@@ -277,6 +296,7 @@ def main() -> None:
         print(f"Recovery on {after['images']} validation images: Top-1 {before['top1_pixel_accuracy_percent']:.2f}% -> "
               f"{after['top1_pixel_accuracy_percent']:.2f}% "
               f"({after['top1_pixel_accuracy_percent'] - before['top1_pixel_accuracy_percent']:+.2f} points); "
+              f"mIoU {before['mean_iou_percent']:.2f}% -> {after['mean_iou_percent']:.2f}%; "
               f"correct {before['correct_pixels']:,} -> {after['correct_pixels']:,} of "
               f"{after['labeled_pixels']:,} labeled pixels", flush=True)
     written = save_outputs(model, stem)
