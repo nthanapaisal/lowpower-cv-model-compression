@@ -1,3 +1,0 @@
-stage,model,images,top1_pixel_accuracy_percent,correct_pixels,labeled_pixels,mean_iou_percent
-before fine-tuning,segformer_b2_pruned68.torchscript.pt,2000,11.263,50467611,448102043,0.26
-after fine-tuning,segformer_b2_pruned68.torchscript.pt,2000,69.694,312301325,448102043,17.406
