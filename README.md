@@ -33,7 +33,6 @@ Files:
 - ./training/distill.py
 
 Locally Existings Directories:
-- ./onnx
 - ./model
 - ./ade20k-scene-parse-150
 ---------------------------------------------------------------
@@ -51,6 +50,6 @@ Flow:
 
 Luke: load_model.py -> (1) prune.py -> (2) finetune.py -> (3) export.py into onnx
 
-Nikki: load_model.py -> (0) convert models into onnx -> (1) quantization.py engines -> (2) evaluate.py -> (4) distill.py -> evaluate.py
+Nikki: load_model.py -> (0) export.py into onnx -> (1) quantization.py engines -> (2) evaluate.py -> (4) distill.py -> evaluate.py
 
 
