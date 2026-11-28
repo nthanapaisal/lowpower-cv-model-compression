@@ -15,7 +15,7 @@ import json
 import os
 from pathlib import Path
 
-PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = PROJECT_DIR / "model"
 HF_CACHE = PROJECT_DIR / ".cache" / "huggingface"
 os.environ["HF_HOME"] = str(HF_CACHE)
@@ -48,11 +48,10 @@ def main() -> None:
             return self.model(pixel_values=pixel_values).logits
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    preprocessor_saved = False
     for variant, checkpoint in CHECKPOINTS:
         print(f"Loading {checkpoint}", flush=True)
         processor = AutoImageProcessor.from_pretrained(checkpoint)
-        if not preprocessor_saved:
+        if variant == "b2":
             metadata = {
                 "height": 512,
                 "width": 512,
@@ -67,7 +66,6 @@ def main() -> None:
             (OUTPUT_DIR / "preprocessing.json").write_text(
                 json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
             )
-            preprocessor_saved = True
 
         model = AutoModelForSemanticSegmentation.from_pretrained(checkpoint)
         model.eval().to(device="cpu", dtype=torch.float32)

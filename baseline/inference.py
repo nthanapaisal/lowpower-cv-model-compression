@@ -1,5 +1,10 @@
+"""Legacy one-off FP16 TensorRT runner retained for earlier experiments.
+
+Use ``training/quantization.py`` and ``training/evaluate.py`` for comparable
+Milestone 2 S0-S4 results, including the fixed dataset and repeat sessions.
+"""
+
 from pathlib import Path
-import subprocess
 
 import torch
 
@@ -10,7 +15,7 @@ except ImportError:
 
 
 ROOT = Path(__file__).resolve().parent.parent
-FP16_MODEL = ROOT / "training" / "model" / "segformer_b2_fp16.onnx"
+FP16_MODEL = ROOT / "model" / "segformer_b2_fp16.onnx"
 
 
 def load_tensorrt_model(model_path, precision, device):
@@ -53,7 +58,6 @@ def run_tensorrt(model, inputs, device):
 def inference_model(model):
     model_path = Path(model)
     print("Model being inferred:", model_path, flush=True)
-    subprocess.run(["sudo", "nvpmodel", "-m", "15"], check=True)
     config = baseline.EvaluationConfig(
         model_name="SegFormer-B2 FP16 TensorRT",
         model_path=str(model_path),

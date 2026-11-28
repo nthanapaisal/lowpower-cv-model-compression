@@ -1,121 +1,91 @@
 #!/usr/bin/env python3
-"""Export a saved PyTorch ``.pth`` model/checkpoint to ONNX.
+"""Export SegFormer models to fixed-shape ONNX for TensorRT (S0-S4).
 
-Examples (from the repository root)::
+    python3 training/export.py model/segformer_b2.torchscript.pt
+    python3 training/export.py model/segformer_b2.torchscript.pt --fp16
 
-    python3 training/export.py S0
-    python3 training/export.py S0 --checkpoint results/S0.pth
+Input: a TorchScript file created by ``training/load_model.py``. The teammate
+hands off pruned and distilled ONNX files directly for S2-S4.
 
-The default lookup checks ``results/``, ``training/results/``, ``model/`` and
-``training/model/`` for ``<name>.pth``. A checkpoint containing a serialized
-``torch.nn.Module`` can be exported directly. For a weights-only state dict,
-provide ``--architecture`` and ``--num-classes`` to construct the model with
-timm first.
+Output: <name>.onnx (or <name>_fp16.onnx with --fp16), opset 17, input "input"
+[1, 3, 512, 512] and output "logits" [1, 150, 128, 128]. With --fp16 the
+weights, input and output are FP16. Without it they are FP32, which is the
+source format used for the S0/S1 baseline comparison.
+
+If onnxruntime is installed, the ONNX model is run once on a random image and
+compared with PyTorch.
 """
+
+from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
 import torch
 
-
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def find_checkpoint(name: str, explicit_path: Path | None) -> Path:
-    if explicit_path is not None:
-        path = explicit_path.expanduser()
-        if not path.is_absolute():
-            path = Path.cwd() / path
-        if not path.is_file():
-            raise FileNotFoundError(f"Checkpoint not found: {path}")
-        return path
-
-    filename = name if name.lower().endswith(".pth") else f"{name}.pth"
-    candidates = [ROOT / folder / filename for folder in (
-        "results", "training/results", "model", "training/model"
-    )]
-    for path in candidates:
-        if path.is_file():
-            return path
-    searched = ", ".join(str(path) for path in candidates)
-    raise FileNotFoundError(
-        f"No checkpoint for {name!r}. Looked in: {searched}. "
-        "Use --checkpoint to specify its location."
-    )
+SIZE = 512
 
 
-def load_model(checkpoint_path: Path, architecture: str | None,
-               num_classes: int | None) -> torch.nn.Module:
+def load_any(path: Path):
+    """A module that maps pixel_values [1,3,512,512] to logits [1,150,128,128]."""
+    if not path.name.endswith(".torchscript.pt"):
+        raise ValueError("Expected a .torchscript.pt model; use the supplied S2-S4 ONNX files directly.")
+    return torch.jit.load(str(path), map_location="cpu").eval()
+
+
+def export_onnx(source: Path, output: Path | None = None, fp16: bool = False, check: bool = True) -> Path:
+    model = load_any(Path(source))
+    if output is None:
+        base = Path(source).name.replace(".torchscript.pt", "").replace(".pth", "")
+        output = Path(source).parent / f"{base}{'_fp16' if fp16 else ''}.onnx"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    example = torch.randn(1, 3, SIZE, SIZE)
+    with torch.inference_mode():
+        expected = model(example).float()
+    if fp16:
+        model = model.half()
+        example = example.half()
+    kwargs = {"input_names": ["input"], "output_names": ["logits"], "opset_version": 17, "dynamic_axes": None}
     try:
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    except TypeError:  # PyTorch versions before weights_only was added.
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        torch.onnx.export(model, example, str(output), dynamo=False, **kwargs)
+    except TypeError:  # older PyTorch without the dynamo argument
+        torch.onnx.export(model, example, str(output), **kwargs)
+    if check:
+        _check(output, example, expected, tolerance=2e-2 if fp16 else 1e-3)
+    return output
 
-    if isinstance(checkpoint, torch.nn.Module):
-        model = checkpoint
-    elif isinstance(checkpoint, dict) and isinstance(checkpoint.get("model"), torch.nn.Module):
-        model = checkpoint["model"]
-    else:
-        if not architecture:
-            raise ValueError(
-                f"{checkpoint_path} contains weights only. Pass --architecture "
-                "and (if needed) --num-classes so the model structure can be created."
-            )
-        try:
-            import timm
-        except ImportError as exc:
-            raise SystemExit("Loading a weights-only checkpoint requires timm.") from exc
-        state_dict = checkpoint
-        if isinstance(checkpoint, dict):
-            for key in ("state_dict", "model_state_dict", "model"):
-                if key in checkpoint and isinstance(checkpoint[key], dict):
-                    state_dict = checkpoint[key]
-                    break
-        if not isinstance(state_dict, dict):
-            raise ValueError(f"Unsupported checkpoint format: {checkpoint_path}")
-        model = timm.create_model(
-            architecture, pretrained=False,
-            num_classes=num_classes if num_classes is not None else 1000,
-        )
-        # Handle checkpoints saved from DistributedDataParallel.
-        state_dict = {key.removeprefix("module."): value
-                      for key, value in state_dict.items()}
-        model.load_state_dict(state_dict)
-    return model.cpu().eval()
+
+def _check(path: Path, example, expected, tolerance: float) -> None:
+    try:
+        import numpy as np
+        import onnxruntime
+    except ImportError:
+        print("onnxruntime not installed: ONNX output not compared with PyTorch.")
+        return
+    session = onnxruntime.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    got = session.run(None, {"input": example.numpy()})[0].astype(np.float32)
+    want = expected.numpy()
+    error = float(np.abs(got - want).max() / (np.abs(want).max() or 1.0))
+    agree = float((got.argmax(1) == want.argmax(1)).mean())
+    print(f"ONNX check: max relative error {error:.2e}, same class at {agree:.2%} of output pixels")
+    if error > tolerance:
+        raise RuntimeError(f"ONNX output differs from PyTorch (relative error {error:.2e}): {path}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("model", help="model/checkpoint name, for example S0")
-    parser.add_argument("--checkpoint", type=Path,
-                        help="explicit .pth path (overrides automatic lookup)")
-    parser.add_argument("--output", type=Path,
-                        help="ONNX output path (default: onnx/<model>.onnx)")
-    parser.add_argument("--architecture",
-                        help="timm architecture for a weights-only checkpoint")
-    parser.add_argument("--num-classes", type=int,
-                        help="classifier output count for --architecture")
-    parser.add_argument("--height", type=int, default=224,
-                        help="input image height (default: 224)")
-    parser.add_argument("--width", type=int, default=224,
-                        help="input image width (default: 224)")
-    parser.add_argument("--opset", type=int, default=17)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("models", nargs="+", type=Path, help="TorchScript model files")
+    parser.add_argument("--fp16", action="store_true", help="FP16 weights, input and output")
+    parser.add_argument("--output-dir", type=Path, default=None, help="default: next to each input")
+    parser.add_argument("--no-check", action="store_true")
     args = parser.parse_args()
-
-    checkpoint_path = find_checkpoint(args.model, args.checkpoint)
-    output_path = args.output or (ROOT / "onnx" / f"{args.model}.onnx")
-    if not output_path.is_absolute():
-        output_path = Path.cwd() / output_path
-    model = load_model(checkpoint_path, args.architecture, args.num_classes)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    sample = torch.zeros(1, 3, args.height, args.width, dtype=torch.float32)
-    torch.onnx.export(
-        model, sample, str(output_path),
-        input_names=["input"], output_names=["output"],
-        opset_version=args.opset, dynamo=False,
-    )
-    print(f"Exported {checkpoint_path} -> {output_path}")
+    for source in args.models:
+        output = None
+        if args.output_dir is not None:
+            base = source.name.replace(".torchscript.pt", "").replace(".pth", "")
+            output = args.output_dir / f"{base}{'_fp16' if args.fp16 else ''}.onnx"
+        path = export_onnx(source, output, fp16=args.fp16, check=not args.no_check)
+        print(f"Saved fixed-shape ONNX model: {path}", flush=True)
 
 
 if __name__ == "__main__":
